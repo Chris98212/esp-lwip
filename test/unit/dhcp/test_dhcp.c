@@ -4,10 +4,17 @@
 #include "lwip/dhcp.h"
 #include "lwip/prot/dhcp.h"
 #include "lwip/prot/iana.h"
+#include "lwip/prot/udp.h"
 #include "lwip/etharp.h"
 #include "lwip/inet.h"
 #include "lwip/timeouts.h"
 #include "netif/ethernet.h"
+
+#include <stddef.h>
+
+/* Packet fixtures use Ethernet, a fixed IPv4 header, and UDP. */
+#define DHCP_TEST_MSG_OFS (SIZEOF_ETH_HDR + IP_HLEN + UDP_HLEN)
+#define DHCP_TEST_OPTIONS_OFS (DHCP_TEST_MSG_OFS + DHCP_OPTIONS_OFS)
 
 #if LWIP_ACD
 #if LWIP_DHCP_DOES_ACD_CHECK
@@ -1322,6 +1329,76 @@ START_TEST(test_dhcp_mtu_validation)
 END_TEST
 #endif /* ESP_LWIP && LWIP_DHCP_ENABLE_MTU_UPDATE */
 
+
+static void
+set_reply_xid(u8_t *packet, u32_t xid)
+{
+  xid = lwip_htonl(xid);
+  memcpy(packet + DHCP_TEST_MSG_OFS + offsetof(struct dhcp_msg, xid), &xid, sizeof(xid));
+}
+
+/* Use separate allocations so sanitizers detect reads beyond each payload. */
+static void
+send_pkt_chained(struct netif *netif, const u8_t *data, const u16_t *lengths, size_t count)
+{
+  struct pbuf *p = NULL;
+  u8_t *payloads[4];
+  size_t i;
+
+  fail_unless(count <= LWIP_ARRAYSIZE(payloads));
+  for (i = 0; i < count; i++) {
+    struct pbuf *q;
+    payloads[i] = (u8_t *)malloc(lengths[i]);
+    fail_unless(payloads[i] != NULL);
+    memcpy(payloads[i], data, lengths[i]);
+    data += lengths[i];
+    q = pbuf_alloc_reference(payloads[i], lengths[i], PBUF_REF);
+    fail_unless(q != NULL);
+    if (p == NULL) {
+      p = q;
+    } else {
+      pbuf_cat(p, q);
+    }
+  }
+  netif->input(p, netif);
+  for (i = 0; i < count; i++) {
+    free(payloads[i]);
+  }
+}
+
+/* An ignored option may span more than one pbuf boundary. */
+START_TEST(test_dhcp_option_across_pbufs)
+{
+  const u8_t ignored_option[18] = { 254, 16 };
+  u8_t packet[sizeof(dhcp_offer)];
+  u8_t *options = packet + DHCP_TEST_OPTIONS_OFS;
+  size_t count;
+  LWIP_UNUSED_ARG(_i);
+
+  tcase = TEST_NONE;
+  netif_add(&net_test, IP4_ADDR_ANY4, IP4_ADDR_ANY4, IP4_ADDR_ANY4,
+            NULL, testif_init, ethernet_input);
+  netif_set_link_up(&net_test);
+  netif_set_up(&net_test);
+  memcpy(packet, dhcp_offer, sizeof(packet));
+  /* Prepend an ignored option; only trailing padding is discarded. */
+  memmove(options + sizeof(ignored_option), options,
+          sizeof(packet) - DHCP_TEST_OPTIONS_OFS - sizeof(ignored_option));
+  memcpy(options, ignored_option, sizeof(ignored_option));
+  for (count = 2; count <= 4; count++) {
+    u16_t lengths[4] = { DHCP_TEST_OPTIONS_OFS + 4, 4, 4, 4 };
+    lengths[count - 1] = (u16_t)(sizeof(packet) - lengths[0] - (count - 2) * lengths[1]);
+    fail_unless(dhcp_start(&net_test) == ERR_OK);
+    set_reply_xid(packet, netif_dhcp_data(&net_test)->xid);
+    send_pkt_chained(&net_test, packet, lengths, count);
+    fail_unless(netif_dhcp_data(&net_test)->state == DHCP_STATE_REQUESTING);
+    dhcp_stop(&net_test);
+  }
+  dhcp_cleanup(&net_test);
+  netif_remove(&net_test);
+}
+END_TEST
+
 /** Create the suite including all tests for this module */
 Suite *
 dhcp_suite(void)
@@ -1332,6 +1409,7 @@ dhcp_suite(void)
     TESTFUNC(test_dhcp_relayed),
     TESTFUNC(test_dhcp_nak_no_endmarker),
     TESTFUNC(test_dhcp_invalid_overload),
+    TESTFUNC(test_dhcp_option_across_pbufs),
     TESTFUNC(test_options)
 #if ESP_LWIP && LWIP_DHCP_ENABLE_MTU_UPDATE
     , TESTFUNC(test_dhcp_mtu_validation)

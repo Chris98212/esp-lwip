@@ -1777,7 +1777,7 @@ decode_next:
         }
       }
     }
-    if (offset >= q->len) {
+    while (offset >= q->len) {
       offset = (u16_t)(offset - q->len);
       offset_max = (u16_t)(offset_max - q->len);
       if (offset < offset_max) {

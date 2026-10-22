@@ -29,6 +29,8 @@
 
 static struct netif net_test;
 static u8_t last_message_type = 0;
+static ip4_addr_t last_destination;
+static ip4_addr_t last_server_identifier;
 
 #if ESP_LWIP && LWIP_DHCP_ENABLE_VENDOR_SPEC_IDS
 static const char vci_string[] = "test-vci";
@@ -150,6 +152,7 @@ static enum tcase {
   TEST_LWIP_DHCP_NAK_NO_ENDMARKER,
   TEST_LWIP_DHCP_INVALID_OVERLOAD,
   TEST_LWIP_DHCP_OPTS,
+  TEST_LWIP_DHCP_SERVER_ID,
   TEST_NONE
 } tcase;
 
@@ -505,6 +508,21 @@ static err_t lwip_tx_func(struct netif *netif, struct pbuf *p)
       break;
     }
     break;
+  case TEST_LWIP_DHCP_SERVER_ID: {
+    struct eth_hdr eth;
+    struct ip_hdr ip;
+    fail_unless(pbuf_copy_partial(p, &eth, SIZEOF_ETH_HDR, 0) == SIZEOF_ETH_HDR);
+    if (eth.type == PP_HTONS(ETHTYPE_IP)) {
+      fail_unless(pbuf_copy_partial(p, &ip, IP_HLEN, SIZEOF_ETH_HDR) == IP_HLEN);
+      ip4_addr_copy(last_destination, ip.dest);
+      fail_unless(get_opt(DHCP_OPTION_MESSAGE_TYPE, p, &last_message_type,
+                          sizeof(last_message_type)) == 1);
+      ip4_addr_set_zero(&last_server_identifier);
+      get_opt(DHCP_OPTION_SERVER_ID, p, (u8_t *)&last_server_identifier.addr,
+              sizeof(last_server_identifier.addr));
+    }
+    break;
+  }
   case TEST_LWIP_DHCP_OPTS:
     if (p->tot_len <= sizeof(arpreply) && memcmp(p->payload, broadcast, sizeof(broadcast)) == 0) {
       /* skip ARP packets, but count them to check number DHCP packets transmitted */
@@ -1399,6 +1417,105 @@ START_TEST(test_dhcp_option_across_pbufs)
 }
 END_TEST
 
+
+static struct dhcp *
+start_dhcp_rebinding(u8_t *ack)
+{
+  u8_t offer[sizeof(dhcp_offer)];
+  struct dhcp *dhcp;
+  int i;
+
+  tcase = TEST_LWIP_DHCP_SERVER_ID;
+  netif_add(&net_test, IP4_ADDR_ANY4, IP4_ADDR_ANY4, IP4_ADDR_ANY4,
+            NULL, testif_init, ethernet_input);
+  netif_set_link_up(&net_test);
+  netif_set_up(&net_test);
+  fail_unless(dhcp_start(&net_test) == ERR_OK);
+  dhcp = netif_dhcp_data(&net_test);
+  memcpy(offer, dhcp_offer, sizeof(offer));
+  set_reply_xid(offer, dhcp->xid);
+  send_pkt(&net_test, offer, sizeof(offer));
+  memcpy(ack, dhcp_ack, sizeof(dhcp_ack));
+  set_reply_xid(ack, dhcp->xid);
+  send_pkt(&net_test, ack, sizeof(dhcp_ack));
+  for (i = 0; (i < 200) && (dhcp->state != DHCP_STATE_BOUND); i++) {
+    tick_lwip();
+  }
+  fail_unless(dhcp->state == DHCP_STATE_BOUND);
+  dhcp->t1_renew_time = 0;
+  dhcp->t2_rebind_time = 1;
+  dhcp_coarse_tmr();
+  fail_unless(dhcp->state == DHCP_STATE_REBINDING);
+  set_reply_xid(ack, dhcp->xid);
+  return dhcp;
+}
+
+/* A rebinding ACK can transfer the lease to a different server (RFC 2131 4.4.5). */
+START_TEST(test_dhcp_rebinding_server_id)
+{
+  u8_t packet[sizeof(dhcp_ack)];
+  u8_t *server_option = packet + DHCP_TEST_OPTIONS_OFS + 2 +
+                        DHCP_OPTION_MESSAGE_TYPE_LEN;
+  struct dhcp *dhcp;
+  struct eth_addr hwaddr;
+  ip4_addr_t server;
+  ip_addr_t old_server;
+  LWIP_UNUSED_ARG(_i);
+
+  dhcp = start_dhcp_rebinding(packet);
+  ip_addr_copy(old_server, dhcp->server_ip_addr);
+  IP4_ADDR(&server, 195, 170, 189, 172);
+  /* Use Option 54, which need not equal the source address (e.g. with relays). */
+  memcpy(server_option + 2, &server.addr, sizeof(server.addr));
+  set_reply_xid(packet, dhcp->xid + 1);
+  send_pkt(&net_test, packet, sizeof(packet));
+  fail_unless(dhcp->state == DHCP_STATE_REBINDING);
+  fail_unless(ip_addr_cmp(&dhcp->server_ip_addr, &old_server));
+  set_reply_xid(packet, dhcp->xid);
+  send_pkt(&net_test, packet, sizeof(packet));
+  fail_unless(dhcp->state == DHCP_STATE_BOUND);
+  fail_unless(ip4_addr_cmp(ip_2_ip4(&dhcp->server_ip_addr), &server));
+  memcpy(hwaddr.addr, packet + offsetof(struct eth_hdr, src), sizeof(hwaddr.addr));
+  fail_unless(etharp_add_static_entry(&server, &hwaddr) == ERR_OK);
+  fail_unless(dhcp_renew(&net_test) == ERR_OK);
+  fail_unless(last_message_type == DHCP_REQUEST);
+  fail_unless(ip4_addr_cmp(&last_destination, &server));
+  dhcp_release_and_stop(&net_test);
+  fail_unless(last_message_type == DHCP_RELEASE);
+  fail_unless(ip4_addr_cmp(&last_destination, &server));
+  fail_unless(ip4_addr_cmp(&last_server_identifier, &server));
+  dhcp_cleanup(&net_test);
+  netif_remove(&net_test);
+}
+END_TEST
+
+/* A missing identifier preserves the recorded server; a bad length rejects the ACK. */
+START_TEST(test_dhcp_ack_server_id_validation)
+{
+  u8_t packet[sizeof(dhcp_ack)];
+  u8_t *server_option = packet + DHCP_TEST_OPTIONS_OFS + 2 +
+                        DHCP_OPTION_MESSAGE_TYPE_LEN;
+  struct dhcp *dhcp;
+  ip_addr_t old_server;
+  LWIP_UNUSED_ARG(_i);
+
+  dhcp = start_dhcp_rebinding(packet);
+  ip_addr_copy(old_server, dhcp->server_ip_addr);
+  server_option[1] = sizeof(ip4_addr_t) - 1; /* Invalid length of Option 54. */
+  send_pkt(&net_test, packet, sizeof(packet));
+  fail_unless(dhcp->state == DHCP_STATE_REBINDING);
+  fail_unless(ip_addr_cmp(&dhcp->server_ip_addr, &old_server));
+  memset(server_option, DHCP_OPTION_PAD, 2 + sizeof(ip4_addr_t)); /* ACK without Option 54. */
+  send_pkt(&net_test, packet, sizeof(packet));
+  fail_unless(dhcp->state == DHCP_STATE_BOUND);
+  fail_unless(ip_addr_cmp(&dhcp->server_ip_addr, &old_server));
+  tcase = TEST_NONE;
+  dhcp_stop(&net_test);
+  dhcp_cleanup(&net_test);
+  netif_remove(&net_test);
+}
+END_TEST
+
 /** Create the suite including all tests for this module */
 Suite *
 dhcp_suite(void)
@@ -1410,6 +1527,8 @@ dhcp_suite(void)
     TESTFUNC(test_dhcp_nak_no_endmarker),
     TESTFUNC(test_dhcp_invalid_overload),
     TESTFUNC(test_dhcp_option_across_pbufs),
+    TESTFUNC(test_dhcp_rebinding_server_id),
+    TESTFUNC(test_dhcp_ack_server_id_validation),
     TESTFUNC(test_options)
 #if ESP_LWIP && LWIP_DHCP_ENABLE_MTU_UPDATE
     , TESTFUNC(test_dhcp_mtu_validation)

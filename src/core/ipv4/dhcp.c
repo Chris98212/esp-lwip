@@ -743,6 +743,12 @@ dhcp_handle_ack(struct netif *netif, struct dhcp_msg *msg_in)
   ip4_addr_set_zero(&dhcp->offered_si_addr);
 #endif /* LWIP_DHCP_BOOTP_FILE */
 
+  /* Record the server that acknowledged the lease, including after rebinding. */
+  if (dhcp_option_given(dhcp, DHCP_OPTION_IDX_SERVER_ID)) {
+    ip_addr_set_ip4_u32(&dhcp->server_ip_addr,
+                        lwip_htonl(dhcp_get_option_value(dhcp, DHCP_OPTION_IDX_SERVER_ID)));
+  }
+
   /* lease time given? */
   if (dhcp_option_given(dhcp, DHCP_OPTION_IDX_LEASE_TIME)) {
     /* remember offered lease time */
